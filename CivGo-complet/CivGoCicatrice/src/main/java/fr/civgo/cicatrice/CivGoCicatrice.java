@@ -1,0 +1,618 @@
+package fr.civgo.cicatrice;
+
+import net.md_5.bungee.api.ChatMessageType;
+import net.md_5.bungee.api.chat.TextComponent;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.Color;
+import org.bukkit.GameMode;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.Particle;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.World;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabExecutor;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.BlockDisplay;
+import org.bukkit.entity.Display;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.metadata.MetadataValue;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.scoreboard.Scoreboard;
+import org.bukkit.scoreboard.Team;
+import org.bukkit.util.Transformation;
+import org.bukkit.util.Vector;
+import org.joml.AxisAngle4f;
+import org.joml.Vector3f;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
+import java.util.regex.Pattern;
+
+public class CivGoCicatrice extends JavaPlugin implements Listener, TabExecutor {
+
+    private static final Pattern NAME = Pattern.compile("^\\p{L}[\\p{L} '\\-]{2,23}$");
+
+    private static final String[] SHAPES = {
+            "une fissure violette", "une marque en étoile brisée", "un croissant de lumière pâle",
+            "une spirale d'éclats", "une entaille irrégulière aux reflets d'améthyste",
+            "des veines sombres en forme de racine"
+    };
+    private static final String[] PARTS = {
+            "sur la joue gauche", "sur la joue droite", "en travers du front", "le long du cou",
+            "sur l'épaule gauche", "sur l'épaule droite", "sur l'avant-bras gauche",
+            "sur l'avant-bras droit", "sur le torse", "au dos de la main gauche", "au dos de la main droite"
+    };
+
+    // emplacement de chaque Cicatrice sur le corps : {devant, gauche, hauteur} en blocs depuis les pieds
+    private static final double[][] OFFS = {
+            {0.27, 0.12, 1.50},   // sur la joue gauche
+            {0.27, -0.12, 1.50},  // sur la joue droite
+            {0.27, 0.00, 1.74},   // en travers du front
+            {0.14, 0.00, 1.40},   // le long du cou
+            {0.00, 0.40, 1.42},   // sur l'épaule gauche
+            {0.00, -0.40, 1.42},  // sur l'épaule droite
+            {0.00, 0.42, 1.02},   // sur l'avant-bras gauche
+            {0.00, -0.42, 1.02},  // sur l'avant-bras droit
+            {0.14, 0.00, 1.15},   // sur le torse
+            {0.00, 0.42, 0.80},   // au dos de la main gauche
+            {0.00, -0.42, 0.80}   // au dos de la main droite
+    };
+    private static final Color[] COLORS = {
+            Color.fromRGB(170, 90, 255), Color.fromRGB(225, 200, 255), Color.fromRGB(190, 225, 255),
+            Color.fromRGB(255, 140, 230), Color.fromRGB(150, 90, 230), Color.fromRGB(110, 50, 170)
+    };
+
+    private static final String SCAR_TAG = "civgo_scar";
+    // taille de la marque lumineuse selon la forme (même ordre que SHAPES) : {largeur, hauteur, épaisseur} en blocs
+    private static final float[][] SIZES = {
+            {0.04f, 0.17f, 0.04f}, {0.11f, 0.11f, 0.04f}, {0.15f, 0.07f, 0.04f},
+            {0.10f, 0.10f, 0.04f}, {0.17f, 0.05f, 0.04f}, {0.06f, 0.17f, 0.04f}
+    };
+    private final Map<UUID, BlockDisplay> scarDisplays = new HashMap<>();
+    final Map<UUID, Long> revealUntil = new HashMap<>();
+    final Map<UUID, Color> markOverride = new HashMap<>();
+    private Resonance resonance;
+    private int scarTicks;
+    private File file;
+    private YamlConfiguration data;
+    private Team team;
+    private final Set<UUID> pending = new HashSet<>();
+    private final Set<UUID> glowing = new HashSet<>();
+    private final Random rnd = new Random();
+
+    @Override
+    public void onEnable() {
+        saveDefaultConfig();
+        file = new File(getDataFolder(), "identities.yml");
+        data = YamlConfiguration.loadConfiguration(file);
+
+        setupTeam();
+        resonance = new Resonance(this);
+        resonance.start();
+        Bukkit.getPluginManager().registerEvents(this, this);
+        getCommand("identite").setExecutor(this);
+        getCommand("cicatrice").setExecutor(this);
+
+        // Pendant un Noir, la Cicatrice luit à son emplacement (particules suivant le joueur, 4 fois par seconde)
+        Bukkit.getScheduler().runTaskTimer(this, this::scarTick, 20L, 2L);
+        // supprime d'éventuelles marques restées après un crash
+        for (World w : Bukkit.getWorlds()) {
+            for (BlockDisplay d : w.getEntitiesByClass(BlockDisplay.class)) {
+                if (d.getScoreboardTags().contains(SCAR_TAG)) d.remove();
+            }
+        }
+
+        // Au cas où le plugin est rechargé alors que des joueurs sont connectés
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            if (has(p.getUniqueId())) apply(p);
+            else pending.add(p.getUniqueId());
+        }
+    }
+
+    @Override
+    public void onDisable() {
+        if (resonance != null) resonance.save();
+        clearDisplays();
+        for (UUID id : glowing) {
+            Player p = Bukkit.getPlayer(id);
+            if (p != null) p.removePotionEffect(PotionEffectType.GLOWING);
+        }
+        glowing.clear();
+    }
+
+    // ------------------------------------------------------------ utilitaires
+
+    private String color(String s) {
+        return ChatColor.translateAlternateColorCodes('&', s == null ? "" : s);
+    }
+
+    private String msg(String key) {
+        return color(getConfig().getString("messages." + key, ""));
+    }
+
+    private void setupTeam() {
+        if (Bukkit.getScoreboardManager() == null) return;
+        Scoreboard sb = Bukkit.getScoreboardManager().getMainScoreboard();
+        team = sb.getTeam("civgo_ident");
+        if (team == null) team = sb.registerNewTeam("civgo_ident");
+        team.setOption(Team.Option.NAME_TAG_VISIBILITY,
+                getConfig().getBoolean("hide-nametags", true) ? Team.OptionStatus.NEVER : Team.OptionStatus.ALWAYS);
+        team.setColor(ChatColor.DARK_PURPLE); // couleur du contour lumineux
+    }
+
+    boolean has(UUID id) {
+        return data.contains("players." + id + ".name");
+    }
+
+    String name(UUID id) {
+        return data.getString("players." + id + ".name");
+    }
+
+    private String scar(UUID id) {
+        return data.getString("players." + id + ".scar");
+    }
+
+    private void save() {
+        try {
+            getDataFolder().mkdirs();
+            data.save(file);
+        } catch (IOException ex) {
+            getLogger().warning("Sauvegarde impossible : " + ex.getMessage());
+        }
+    }
+
+    private boolean nameTaken(String n) {
+        ConfigurationSection s = data.getConfigurationSection("players");
+        if (s == null) return false;
+        for (String k : s.getKeys(false)) {
+            if (n.equalsIgnoreCase(s.getString(k + ".name"))) return true;
+        }
+        return false;
+    }
+
+    private String randomScar() {
+        return SHAPES[rnd.nextInt(SHAPES.length)] + " " + PARTS[rnd.nextInt(PARTS.length)];
+    }
+
+    static boolean isNoir(World w) {
+        for (MetadataValue v : w.getMetadata("civgo_noir")) {
+            if (v.asBoolean()) return true;
+        }
+        return false;
+    }
+
+    /** Applique le nom RP : chat, liste des joueurs, pseudo masqué. */
+    private void apply(Player p) {
+        String n = name(p.getUniqueId());
+        if (n == null) return;
+        p.setDisplayName(n);
+        p.setPlayerListName(n);
+        if (team != null) team.addEntry(p.getName());
+        data.set("players." + p.getUniqueId() + ".mc", p.getName());
+    }
+
+    private void askName(Player p) {
+        if (!p.isOnline() || !pending.contains(p.getUniqueId())) return;
+        p.sendTitle(msg("ask-title"), msg("ask-subtitle"), 10, 100, 20);
+        p.sendMessage(msg("ask-chat"));
+    }
+
+    private void register(Player p, String raw) {
+        UUID id = p.getUniqueId();
+        if (!pending.contains(id)) return;
+        String n = raw.trim().replaceAll("\\s+", " ");
+        if (!NAME.matcher(n).matches()) {
+            p.sendMessage(msg("invalid"));
+            return;
+        }
+        if (nameTaken(n)) {
+            p.sendMessage(msg("taken"));
+            return;
+        }
+        String scar = randomScar();
+        data.set("players." + id + ".name", n);
+        data.set("players." + id + ".scar", scar);
+        save();
+        pending.remove(id);
+        apply(p);
+        p.sendTitle("§5" + n, "§7Ta Cicatrice : §d" + scar, 10, 120, 30);
+        p.sendMessage(ChatColor.GRAY + "Tu es désormais " + ChatColor.WHITE + n + ChatColor.GRAY
+                + ". Tu portes " + ChatColor.LIGHT_PURPLE + scar + ChatColor.GRAY
+                + ". Elle brillera pendant les Noirs.");
+    }
+
+    // ------------------------------------------------------------ événements
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        Player p = e.getPlayer();
+        if (getConfig().getBoolean("hide-join-messages", true)) e.setJoinMessage(null);
+        if (has(p.getUniqueId())) {
+            apply(p);
+            save();
+        } else {
+            pending.add(p.getUniqueId());
+            if (team != null) team.addEntry(p.getName());
+            Bukkit.getScheduler().runTaskLater(this, () -> askName(p), 40L);
+        }
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        if (getConfig().getBoolean("hide-join-messages", true)) e.setQuitMessage(null);
+        pending.remove(e.getPlayer().getUniqueId());
+        glowing.remove(e.getPlayer().getUniqueId());
+        dropDisplay(e.getPlayer().getUniqueId());
+    }
+
+    /** Un joueur sans identité ne peut pas bouger tant qu'il n'a pas choisi son nom. */
+    @EventHandler(ignoreCancelled = true)
+    public void onMove(PlayerMoveEvent e) {
+        if (!pending.contains(e.getPlayer().getUniqueId()) || e.getTo() == null) return;
+        if (e.getFrom().getBlockX() != e.getTo().getBlockX()
+                || e.getFrom().getBlockY() != e.getTo().getBlockY()
+                || e.getFrom().getBlockZ() != e.getTo().getBlockZ()) {
+            e.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onChat(AsyncPlayerChatEvent e) {
+        Player p = e.getPlayer();
+        if (pending.contains(p.getUniqueId())) {
+            e.setCancelled(true);
+            String raw = e.getMessage();
+            Bukkit.getScheduler().runTask(this, () -> register(p, raw));
+            return;
+        }
+        if (has(p.getUniqueId())) {
+            e.setFormat(color(getConfig().getString("chat-format", "&f%1$s&7 » &f%2$s")));
+        }
+    }
+
+    /** Clic droit sur un joueur proche : on retient son nom RP (accroupi : on voit aussi sa Cicatrice). */
+    @EventHandler
+    public void onInteract(PlayerInteractEntityEvent e) {
+        if (e.getHand() != EquipmentSlot.HAND) return;
+        if (!(e.getRightClicked() instanceof Player t)) return;
+        Player p = e.getPlayer();
+        String n = name(t.getUniqueId());
+        if (n == null || !p.getWorld().equals(t.getWorld())) return;
+        if (p.getLocation().distance(t.getLocation()) > getConfig().getDouble("recognize-distance", 6)) return;
+
+        p.spigot().sendMessage(ChatMessageType.ACTION_BAR, new TextComponent("§7Tu reconnais §f" + n));
+        if (p.isSneaking() && scar(t.getUniqueId()) != null) {
+            p.sendMessage(ChatColor.GRAY + "Tu remarques chez " + ChatColor.WHITE + n + ChatColor.GRAY
+                    + " : " + ChatColor.LIGHT_PURPLE + scar(t.getUniqueId()) + ChatColor.GRAY + ".");
+        }
+    }
+
+    private boolean isRevealed(UUID id) {
+        Long t = revealUntil.get(id);
+        if (t == null) return false;
+        if (t < System.currentTimeMillis()) {
+            revealUntil.remove(id);
+            return false;
+        }
+        return true;
+    }
+
+    /** L'Amulette de Cicatrice (tenue en main secondaire) cache la Cicatrice. */
+    private boolean hasAmulet(Player p) {
+        ItemStack off = p.getInventory().getItemInOffHand();
+        if (off == null || !off.hasItemMeta() || !off.getItemMeta().hasItemModel()) return false;
+        org.bukkit.NamespacedKey k = off.getItemMeta().getItemModel();
+        return k != null && k.getKey().equals("amulette_cicatrice");
+    }
+
+    private BlockDisplay spawnMark(Location at, int shape) {
+        final float[] sz = SIZES[shape];
+        final Color glow = COLORS[shape];
+        return at.getWorld().spawn(at, BlockDisplay.class, d -> {
+            d.setBlock(Material.AMETHYST_BLOCK.createBlockData());
+            d.setTransformation(new Transformation(
+                    new Vector3f(-sz[0] / 2, -sz[1] / 2, -sz[2] / 2), new AxisAngle4f(0f, 0f, 0f, 1f),
+                    new Vector3f(sz[0], sz[1], sz[2]), new AxisAngle4f(0f, 0f, 0f, 1f)));
+            d.setBrightness(new Display.Brightness(15, 15));
+            d.setGlowing(true);
+            d.setGlowColorOverride(glow);
+            d.setPersistent(false);
+            d.addScoreboardTag(SCAR_TAG);
+            d.setTeleportDuration(2);
+        });
+    }
+
+    private void dropDisplay(UUID id) {
+        BlockDisplay d = scarDisplays.remove(id);
+        if (d != null && d.isValid()) d.remove();
+    }
+
+    private void clearDisplays() {
+        for (BlockDisplay d : scarDisplays.values()) {
+            if (d.isValid()) d.remove();
+        }
+        scarDisplays.clear();
+    }
+
+    /** La Cicatrice luit uniquement à son emplacement, pendant les Noirs (pas de contour sur tout le corps). */
+    private void scarTick() {
+        boolean any = false;
+        for (World w : Bukkit.getWorlds()) {
+            if (isNoir(w)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any && !revealUntil.isEmpty()) {
+            revealUntil.values().removeIf(t -> t < System.currentTimeMillis());
+            any = !revealUntil.isEmpty();
+        }
+        if (!any) {
+            if (!scarDisplays.isEmpty()) clearDisplays();
+            return;
+        }
+        scarTicks++;
+
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            UUID id = p.getUniqueId();
+            boolean rev = isRevealed(id);
+            if (!has(id) || !(isNoir(p.getWorld()) || rev) || (!rev && hasAmulet(p))) {
+                dropDisplay(id);
+                continue;
+            }
+            if (p.getGameMode() == GameMode.SPECTATOR || p.isInvisible() || p.isSwimming() || p.isGliding()) {
+                dropDisplay(id);
+                continue;
+            }
+            String scar = scar(id);
+            if (scar == null) continue;
+            // rappel : où luit ta Cicatrice (toutes les ~2,5 s)
+            if (scarTicks % 25 == 0 && getConfig().getBoolean("scar-reminder", true)) {
+                p.spigot().sendMessage(ChatMessageType.ACTION_BAR, new TextComponent("§5✦ §dTa Cicatrice luit §7: " + scar));
+            }
+
+            int part = -1;
+            for (int i = 0; i < PARTS.length; i++) {
+                if (scar.endsWith(PARTS[i])) {
+                    part = i;
+                    break;
+                }
+            }
+            if (part < 0) continue;
+            int shape = 0;
+            for (int i = 0; i < SHAPES.length; i++) {
+                if (scar.startsWith(SHAPES[i])) {
+                    shape = i;
+                    break;
+                }
+            }
+
+            Location base = p.getLocation();
+            Vector dir = base.getDirection();
+            dir.setY(0);
+            if (dir.lengthSquared() < 1.0E-6) continue;
+            dir.normalize();
+            double f = OFFS[part][0], l = OFFS[part][1], y = OFFS[part][2];
+            if (p.isSneaking()) y *= 0.87;
+            Location at = new Location(base.getWorld(),
+                    base.getX() + dir.getX() * f + dir.getZ() * l,
+                    base.getY() + y,
+                    base.getZ() + dir.getZ() * f - dir.getX() * l);
+
+            at.setYaw(base.getYaw());
+            at.setPitch(0f);
+
+            // la Cicatrice : une petite marque lumineuse avec contour "glowing", posée sur le corps et qui suit le joueur
+            Color use = markOverride.getOrDefault(id, COLORS[shape]);
+            BlockDisplay disp = scarDisplays.get(id);
+            if (disp == null || !disp.isValid() || !disp.getWorld().equals(at.getWorld())) {
+                if (disp != null && disp.isValid()) disp.remove();
+                disp = spawnMark(at, shape);
+                scarDisplays.put(id, disp);
+                if (!getConfig().getBoolean("own-scar-visible", true)) p.hideEntity(this, disp);
+            } else {
+                disp.teleport(at);
+            }
+
+            disp.setGlowColorOverride(use);
+            // quelques particules en plus (toutes les ~6 ticks)
+            if (scarTicks % 3 != 0) continue;
+            Particle.DustOptions dust = new Particle.DustOptions(use, 1.4f);
+            boolean sparkle = rnd.nextInt(3) == 0;
+            for (Player v : p.getWorld().getPlayers()) {
+                // le porteur voit aussi sa propre Cicatrice (en 3e personne, touche F5), sauf si own-scar-visible: false
+                if ((v.equals(p) && !getConfig().getBoolean("own-scar-visible", true))
+                        || v.getLocation().distanceSquared(at) > 48 * 48) continue;
+                v.spawnParticle(Particle.DUST, at, 3, 0.03, 0.03, 0.03, 0, dust);
+                if (sparkle) {
+                    v.spawnParticle(Particle.GLOW, at, 1, 0.05, 0.05, 0.05, 0.0);
+                    v.spawnParticle(Particle.END_ROD, at, 1, 0.04, 0.04, 0.04, 0.0);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ commandes
+
+    @Override
+    public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
+        if (c.getName().equalsIgnoreCase("cicatrice")) {
+            if (a.length > 0 && resonance.handle(s, a)) return true;
+            return cicatriceCommand(s, a);
+        }
+
+        boolean admin = s.hasPermission("civgo.cicatrice.admin");
+        if (a.length == 0) {
+            if (s instanceof Player p && name(p.getUniqueId()) != null) {
+                s.sendMessage(ChatColor.GRAY + "Tu es " + ChatColor.WHITE + name(p.getUniqueId()) + ChatColor.GRAY + ".");
+            } else {
+                s.sendMessage(ChatColor.GRAY + "Tu n'as pas encore d'identité.");
+            }
+            return true;
+        }
+        if (!admin) {
+            s.sendMessage(ChatColor.RED + "Tu n'as pas la permission.");
+            return true;
+        }
+        switch (a[0].toLowerCase()) {
+            case "whois" -> whois(s, a);
+            case "reset" -> reset(s, a);
+            case "setnom" -> setNom(s, a);
+            default -> s.sendMessage(ChatColor.GRAY + "/identite whois <texte> | reset <pseudo> | setnom <pseudo> <nom>");
+        }
+        return true;
+    }
+
+    private boolean cicatriceCommand(CommandSender s, String[] a) {
+        if (a.length >= 2 && a[0].equalsIgnoreCase("reveal")) {
+            if (!s.hasPermission("civgo.cicatrice.admin")) {
+                s.sendMessage(ChatColor.RED + "Tu n'as pas la permission.");
+                return true;
+            }
+            Player t = Bukkit.getPlayerExact(a[1]);
+            if (t == null) {
+                s.sendMessage(ChatColor.RED + "Joueur introuvable.");
+                return true;
+            }
+            int secs = 8;
+            if (a.length > 2) {
+                try {
+                    secs = Math.max(1, Math.min(60, Integer.parseInt(a[2])));
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            revealUntil.put(t.getUniqueId(), System.currentTimeMillis() + secs * 1000L);
+            return true;
+        }
+        UUID id;
+        String owner;
+        if (a.length > 0 && s.hasPermission("civgo.cicatrice.admin")) {
+            OfflinePlayer t = Bukkit.getOfflinePlayer(a[0]);
+            id = t.getUniqueId();
+            owner = a[0];
+        } else if (s instanceof Player p) {
+            id = p.getUniqueId();
+            owner = "Tu";
+        } else {
+            s.sendMessage("Usage : /cicatrice <pseudo>");
+            return true;
+        }
+        if (scar(id) == null) {
+            s.sendMessage(ChatColor.GRAY + "Aucune Cicatrice enregistrée.");
+        } else {
+            s.sendMessage(ChatColor.GRAY + owner + " porte " + ChatColor.LIGHT_PURPLE + scar(id) + ChatColor.GRAY + ".");
+        }
+        return true;
+    }
+
+    private void whois(CommandSender s, String[] a) {
+        if (a.length < 2) {
+            s.sendMessage(ChatColor.RED + "Usage : /identite whois <texte>");
+            return;
+        }
+        String q = String.join(" ", java.util.Arrays.copyOfRange(a, 1, a.length)).toLowerCase(Locale.ROOT);
+        ConfigurationSection sec = data.getConfigurationSection("players");
+        int found = 0;
+        if (sec != null) {
+            for (String k : sec.getKeys(false)) {
+                String rp = sec.getString(k + ".name", "");
+                String mc = sec.getString(k + ".mc", "?");
+                if (rp.toLowerCase(Locale.ROOT).contains(q) || mc.toLowerCase(Locale.ROOT).contains(q)) {
+                    s.sendMessage(ChatColor.LIGHT_PURPLE + rp + ChatColor.GRAY + " = " + ChatColor.WHITE + mc);
+                    if (++found >= 10) break;
+                }
+            }
+        }
+        if (found == 0) s.sendMessage(ChatColor.GRAY + "Aucun résultat.");
+    }
+
+    private void reset(CommandSender s, String[] a) {
+        if (a.length < 2) {
+            s.sendMessage(ChatColor.RED + "Usage : /identite reset <pseudo>");
+            return;
+        }
+        OfflinePlayer t = Bukkit.getOfflinePlayer(a[1]);
+        UUID id = t.getUniqueId();
+        if (!has(id)) {
+            s.sendMessage(ChatColor.RED + "Ce joueur n'a pas d'identité.");
+            return;
+        }
+        data.set("players." + id, null);
+        save();
+        glowing.remove(id);
+        Player online = t.getPlayer();
+        if (online != null) {
+            online.setDisplayName(online.getName());
+            online.setPlayerListName(online.getName());
+            online.removePotionEffect(PotionEffectType.GLOWING);
+            pending.add(id);
+            askName(online);
+        }
+        s.sendMessage(ChatColor.GRAY + "Identité de " + a[1] + " réinitialisée.");
+    }
+
+    private void setNom(CommandSender s, String[] a) {
+        if (a.length < 3) {
+            s.sendMessage(ChatColor.RED + "Usage : /identite setnom <pseudo> <nom>");
+            return;
+        }
+        OfflinePlayer t = Bukkit.getOfflinePlayer(a[1]);
+        UUID id = t.getUniqueId();
+        if (!has(id)) {
+            s.sendMessage(ChatColor.RED + "Ce joueur n'a pas d'identité (utilise reset ou attends qu'il en choisisse une).");
+            return;
+        }
+        String n = String.join(" ", java.util.Arrays.copyOfRange(a, 2, a.length)).trim();
+        if (!NAME.matcher(n).matches()) {
+            s.sendMessage(msg("invalid"));
+            return;
+        }
+        if (nameTaken(n) && !n.equalsIgnoreCase(name(id))) {
+            s.sendMessage(msg("taken"));
+            return;
+        }
+        data.set("players." + id + ".name", n);
+        save();
+        if (t.getPlayer() != null) apply(t.getPlayer());
+        s.sendMessage(ChatColor.GRAY + a[1] + " s'appelle maintenant " + ChatColor.WHITE + n + ChatColor.GRAY + ".");
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender s, Command c, String alias, String[] a) {
+        if (c.getName().equalsIgnoreCase("cicatrice") && a.length == 1) {
+            return new ArrayList<>(List.of("resonance", "pulsation", "pacte", "accepter", "rompre"));
+        }
+        if (c.getName().equalsIgnoreCase("identite") && a.length == 1 && s.hasPermission("civgo.cicatrice.admin")) {
+            return new ArrayList<>(List.of("whois", "reset", "setnom"));
+        }
+        if (c.getName().equalsIgnoreCase("identite") && a.length > 1 && a[0].equalsIgnoreCase("whois")) {
+            return List.of();
+        }
+        return null;
+    }
+}
