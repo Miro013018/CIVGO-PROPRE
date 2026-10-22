@@ -369,7 +369,7 @@ class Resonance implements Listener {
                     double ang = Math.PI * 2 * i / 48;
                     p.getWorld().spawnParticle(Particle.END_ROD, c.clone().add(Math.cos(ang) * 2.5, 0, Math.sin(ang) * 2.5), 1, 0, 0, 0, 0);
                 }
-                p.playSound(p.getLocation(), Sound.BLOCK_AMETHYST_CLUSTER_RESONATE, 1.2f, 0.7f);
+                p.playSound(p.getLocation(), Sound.BLOCK_AMETHYST_BLOCK_RESONATE, 1.2f, 0.7f);
                 bar(p, "§d✦ Pulsation lunaire : §f" + found + (found > 1 ? " présences" : " présence") + " révélée" + (found > 1 ? "s" : ""));
                 return true;
             }
