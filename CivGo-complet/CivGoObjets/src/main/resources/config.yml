@@ -14,8 +14,10 @@ arc:
 pioche:
   blocks-per-eclat: 150        # 1 Éclat tous les X blocs minés (ajouté au solde Vault)
 
+# Casque Lunaire : vrai casque 3D posé sur la tête (esthétique, aucun pouvoir)
 casque:
-  damage-reduction-noir: 0.10  # -10 % de dégâts des monstres pendant un Noir
-
-bouclier:
-  protect-all-sides: true
+  scale: 0.8                   # taille du casque
+  height-offset: 0.16          # monte (+) ou descend (-) le casque sur la tête
+  yaw-offset: 180              # si le casque regarde dans le mauvais sens : essaie 0
+  invert-pitch: true           # si le casque penche à l'envers quand tu lèves/baisses la tête : mets false
+  visible-to-owner: true       # false = le porteur ne voit pas son propre casque (visible pour les autres)
