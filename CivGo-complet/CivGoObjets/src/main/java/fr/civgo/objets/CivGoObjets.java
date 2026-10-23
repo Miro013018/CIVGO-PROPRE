@@ -17,16 +17,12 @@ import org.bukkit.World;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.block.Block;
-import org.bukkit.block.BlockFace;
-import org.bukkit.block.data.type.Light;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabExecutor;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.AbstractArrow;
-import org.bukkit.entity.Display;
 import org.bukkit.entity.Entity;
-import org.bukkit.entity.Interaction;
 import org.bukkit.entity.ItemDisplay;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Monster;
@@ -42,9 +38,9 @@ import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.inventory.meta.PotionMeta;
 import org.bukkit.inventory.meta.components.EquippableComponent;
@@ -58,10 +54,12 @@ import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.potion.PotionType;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.util.Transformation;
 import org.bukkit.util.Vector;
+import org.joml.AxisAngle4f;
+import org.joml.Vector3f;
 
 import java.io.File;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -74,36 +72,61 @@ import java.util.UUID;
 /**
  * CivGo Objets : donne un pouvoir à chaque objet du pack de ressources CivGo.
  * Les objets sont reconnus grâce à leur modèle (composant item_model "civgo:<nom>"), donc ceux donnés par /give marchent aussi.
+ * Le Casque Lunaire est un objet purement esthétique : un vrai casque 3D posé sur la tête du joueur.
  */
 public class CivGoObjets extends JavaPlugin implements Listener, TabExecutor {
 
-    private static final String TAG = "civgo_lantern";
+    private static final String HAT_TAG = "civgo_hat";
 
     private record Def(String id, Material base, String color, String name, List<String> lore) {}
 
     private final Map<String, Def> defs = new LinkedHashMap<>();
     private final Map<UUID, Long> waveCooldown = new HashMap<>();
+    private final Map<UUID, ItemDisplay> hats = new HashMap<>();
     private final Set<String> placed = new HashSet<>();
-    private final Map<String, UUID[]> lanterns = new HashMap<>();   // "monde,x,y,z" -> {affichage, interaction}
     private NamespacedKey minedKey;
-    private File lanternFile;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         minedKey = new NamespacedKey(this, "mined");
         defs();
-        lanternFile = new File(getDataFolder(), "lanternes.yml");
-        loadLanterns();
+        purgeOldEntities();
         Bukkit.getPluginManager().registerEvents(this, this);
         getCommand("objets").setExecutor(this);
-        Bukkit.getScheduler().runTaskTimer(this, this::helmetTick, 40L, 40L);
-        Bukkit.getScheduler().runTaskTimer(this, this::lanternTick, 40L, 20L);
+        Bukkit.getScheduler().runTaskTimer(this, this::hatTick, 20L, 2L);
     }
 
     @Override
     public void onDisable() {
-        saveLanterns();
+        for (ItemDisplay d : hats.values()) {
+            if (d.isValid()) d.remove();
+        }
+        hats.clear();
+    }
+
+    /** Nettoie les anciens casques flottants et les anciennes lanternes (objet supprimé). */
+    private void purgeOldEntities() {
+        for (World w : Bukkit.getWorlds()) {
+            for (Entity en : w.getEntities()) {
+                if (en.getScoreboardTags().contains(HAT_TAG) || en.getScoreboardTags().contains("civgo_lantern")) en.remove();
+            }
+        }
+        File old = new File(getDataFolder(), "lanternes.yml");
+        if (old.exists()) {
+            YamlConfiguration y = YamlConfiguration.loadConfiguration(old);
+            for (String line : y.getStringList("lanternes")) {
+                String[] p = line.split(";")[0].split(",");
+                World w = p.length == 4 ? Bukkit.getWorld(p[0]) : null;
+                if (w == null) continue;
+                try {
+                    Block b = w.getBlockAt(Integer.parseInt(p[1]), Integer.parseInt(p[2]), Integer.parseInt(p[3]));
+                    if (b.getType() == Material.LIGHT) b.setType(Material.AIR, false);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            old.delete();
+        }
     }
 
     // ------------------------------------------------------------ objets
@@ -120,14 +143,9 @@ public class CivGoObjets extends JavaPlugin implements Listener, TabExecutor {
         add("arc_noirs", Material.BOW, "§5", "Arc des Noirs",
                 "§7Tire des Éclats : +70 % de dégâts, éclats lumineux à l'impact.",
                 "§7Révèle la Cicatrice du joueur touché pendant 8 s.");
-        add("casque_lunaire", Material.DIAMOND_HELMET, "§f", "Casque Lunaire",
-                "§7Annule l'obscurité des Noirs et du Cratère.",
-                "§7Pendant un Noir : vision nocturne, -10 % de dégâts des monstres.");
-        add("bouclier_chute", Material.SHIELD, "§d", "Bouclier de la Chute",
-                "§7Maintiens le clic droit : protège de TOUS les côtés.");
-        add("lanterne_lunaire", Material.STICK, "§b", "Lanterne Lunaire",
-                "§7Pose-la sur le sol ou au plafond (clic).",
-                "§7Elle ne luit que pendant les Noirs, d'une lueur violette.");
+        add("casque_lunaire", Material.STICK, "§f", "Casque Lunaire",
+                "§7Un casque lunaire qui se pose sur la tête.",
+                "§7Purement esthétique : clic droit pour l'enfiler.");
         add("amulette_cicatrice", Material.STICK, "§6", "Amulette de Cicatrice",
                 "§7Tenue en main secondaire : cache ta Cicatrice pendant les Noirs.",
                 "§7L'Arc des Noirs la révèle quand même.");
@@ -148,23 +166,14 @@ public class CivGoObjets extends JavaPlugin implements Listener, TabExecutor {
         m.setLore(d.lore());
         if (m instanceof PotionMeta pm) pm.setBasePotionType(PotionType.NIGHT_VISION);
         if (id.equals("casque_lunaire")) {
-            // apparence portée propre au casque (pack de ressources), ce n'est pas un casque en netherite
+            // se porte sur la tête, mais l'armure portée est invisible : le vrai casque 3D est affiché par le plugin
             EquippableComponent eq = m.getEquippable();
             eq.setSlot(EquipmentSlot.HEAD);
-            eq.setModel(NamespacedKey.fromString("civgo:casque_lunaire"));
+            eq.setModel(NamespacedKey.fromString("civgo:vide"));
             m.setEquippable(eq);
+            m.setMaxStackSize(1);
         }
         it.setItemMeta(m);
-        return it;
-    }
-
-    private ItemStack lanternItem(boolean lit) {
-        ItemStack it = make("lanterne_lunaire");
-        if (lit) {
-            ItemMeta m = it.getItemMeta();
-            m.setItemModel(NamespacedKey.fromString("civgo:lanterne_lunaire_allumee"));
-            it.setItemMeta(m);
-        }
         return it;
     }
 
@@ -205,11 +214,64 @@ public class CivGoObjets extends JavaPlugin implements Listener, TabExecutor {
         return new Particle.DustOptions(Color.fromRGB(180, 100, 255), size);
     }
 
-    // ------------------------------------------------------------ Épée de Lune, Casque, Bouclier (dégâts)
+    // ------------------------------------------------------------ Casque Lunaire (vrai casque 3D posé sur la tête)
+
+    private void hatTick() {
+        double yawOffset = getConfig().getDouble("casque.yaw-offset", 180);
+        boolean invert = getConfig().getBoolean("casque.invert-pitch", true);
+        double height = getConfig().getDouble("casque.height-offset", 0.16);
+        float scale = (float) getConfig().getDouble("casque.scale", 0.8);
+        boolean ownerSees = getConfig().getBoolean("casque.visible-to-owner", true);
+
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            UUID id = p.getUniqueId();
+            boolean wearing = "casque_lunaire".equals(model(p.getInventory().getHelmet()))
+                    && p.getGameMode() != GameMode.SPECTATOR && !p.isInvisible() && !p.isSwimming() && !p.isGliding();
+            if (!wearing) {
+                removeHat(id);
+                continue;
+            }
+            Location eye = p.getEyeLocation();
+            Location at = new Location(p.getWorld(), eye.getX(), eye.getY() + height, eye.getZ(),
+                    (float) (eye.getYaw() + yawOffset), invert ? -eye.getPitch() : eye.getPitch());
+            ItemDisplay d = hats.get(id);
+            if (d == null || !d.isValid() || !d.getWorld().equals(at.getWorld())) {
+                if (d != null && d.isValid()) d.remove();
+                d = spawnHat(at, scale);
+                hats.put(id, d);
+                if (!ownerSees) p.hideEntity(this, d);
+            } else {
+                d.teleport(at);
+            }
+        }
+    }
+
+    private ItemDisplay spawnHat(Location at, float scale) {
+        ItemStack shown = make("casque_lunaire");
+        return at.getWorld().spawn(at, ItemDisplay.class, dd -> {
+            dd.setItemStack(shown);
+            dd.setTransformation(new Transformation(new Vector3f(0f, 0f, 0f), new AxisAngle4f(0f, 0f, 0f, 1f),
+                    new Vector3f(scale, scale, scale), new AxisAngle4f(0f, 0f, 0f, 1f)));
+            dd.setPersistent(false);
+            dd.setTeleportDuration(2);
+            dd.addScoreboardTag(HAT_TAG);
+        });
+    }
+
+    private void removeHat(UUID id) {
+        ItemDisplay d = hats.remove(id);
+        if (d != null && d.isValid()) d.remove();
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        removeHat(e.getPlayer().getUniqueId());
+    }
+
+    // ------------------------------------------------------------ Épée de Lune (dégâts)
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onDamage(EntityDamageByEntityEvent e) {
-        // Épée de Lune
         if (e.getDamager() instanceof Player p && e.getEntity() instanceof LivingEntity t
                 && e.getCause() == EntityDamageEvent.DamageCause.ENTITY_ATTACK
                 && "epee_lune".equals(model(p.getInventory().getItemInMainHand()))) {
@@ -225,48 +287,6 @@ public class CivGoObjets extends JavaPlugin implements Listener, TabExecutor {
                 p.setHealth(Math.min(maxHealth(p), p.getHealth() + heal));
             }
         }
-
-        if (e.getEntity() instanceof Player v) {
-            // Casque Lunaire : moins de dégâts des monstres pendant un Noir
-            if (e.getDamager() instanceof Monster && noirActive()
-                    && "casque_lunaire".equals(model(v.getInventory().getHelmet()))) {
-                e.setDamage(e.getDamage() * (1.0 - getConfig().getDouble("casque.damage-reduction-noir", 0.10)));
-            }
-            shieldAllSides(e, v);
-        }
-    }
-
-    /** Bouclier de la Chute : bloque aussi les coups venant des côtés et de dos. */
-    private void shieldAllSides(EntityDamageByEntityEvent e, Player v) {
-        if (!getConfig().getBoolean("bouclier.protect-all-sides", true)) return;
-        EntityDamageEvent.DamageCause c = e.getCause();
-        if (c != EntityDamageEvent.DamageCause.ENTITY_ATTACK && c != EntityDamageEvent.DamageCause.ENTITY_SWEEP_ATTACK
-                && c != EntityDamageEvent.DamageCause.PROJECTILE && c != EntityDamageEvent.DamageCause.ENTITY_EXPLOSION) return;
-        if (!v.isBlocking()) return;
-        // le bouclier qui bloque : main principale en priorité, sinon main secondaire
-        ItemStack shield = v.getInventory().getItemInMainHand();
-        if (!"bouclier_chute".equals(model(shield))) shield = v.getInventory().getItemInOffHand();
-        if (!"bouclier_chute".equals(model(shield))) return;
-
-        // le bouclier vanilla bloque déjà tout ce qui vient de face (180° devant)
-        Vector toVictim = v.getLocation().toVector().subtract(e.getDamager().getLocation().toVector());
-        toVictim.setY(0);
-        if (toVictim.lengthSquared() > 1.0E-6) {
-            toVictim.normalize();
-            if (toVictim.dot(v.getLocation().getDirection().setY(0).normalize()) < 0) return;
-        }
-        double dmg = e.getFinalDamage();
-        e.setCancelled(true);
-        v.getWorld().playSound(v.getLocation(), Sound.ITEM_SHIELD_BLOCK, 1f, 1f);
-        v.getWorld().spawnParticle(Particle.DUST, v.getLocation().add(0, 1, 0), 14, 0.5, 0.6, 0.5, 0, violet(1.2f));
-        if (shield.getItemMeta() instanceof Damageable dm) {
-            dm.setDamage(dm.getDamage() + Math.max(1, (int) Math.round(dmg)));
-            shield.setItemMeta(dm);
-            if (dm.getDamage() >= shield.getType().getMaxDurability()) {
-                shield.setAmount(0);
-                v.getWorld().playSound(v.getLocation(), Sound.ITEM_SHIELD_BREAK, 1f, 1f);
-            }
-        }
     }
 
     // ------------------------------------------------------------ Épée : Onde lunaire / Boussole (clic droit)
@@ -274,18 +294,11 @@ public class CivGoObjets extends JavaPlugin implements Listener, TabExecutor {
     @EventHandler
     public void onUse(PlayerInteractEvent e) {
         if (e.getHand() != EquipmentSlot.HAND) return;
-        Player p = e.getPlayer();
         Action a = e.getAction();
-        ItemStack hand = p.getInventory().getItemInMainHand();
-        String id = model(hand);
-        if (id == null) return;
-
-        if (id.equals("lanterne_lunaire") && a == Action.RIGHT_CLICK_BLOCK) {
-            e.setCancelled(true);
-            placeLantern(p, e);
-            return;
-        }
         if (a != Action.RIGHT_CLICK_AIR && a != Action.RIGHT_CLICK_BLOCK) return;
+        Player p = e.getPlayer();
+        String id = model(p.getInventory().getItemInMainHand());
+        if (id == null) return;
 
         if (id.equals("epee_lune")) {
             long now = System.currentTimeMillis();
@@ -308,7 +321,7 @@ public class CivGoObjets extends JavaPlugin implements Listener, TabExecutor {
         Location c = p.getLocation().add(0, 0.2, 0);
         p.getWorld().playSound(c, Sound.BLOCK_AMETHYST_CLUSTER_BREAK, 1.2f, 0.6f);
         p.getWorld().playSound(c, Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1f, 0.7f);
-        for (int i = 0; i < 40; i++) {                          // anneau de lumière
+        for (int i = 0; i < 40; i++) {
             double ang = Math.PI * 2 * i / 40;
             p.getWorld().spawnParticle(Particle.END_ROD, c.clone().add(Math.cos(ang) * r, 0.3, Math.sin(ang) * r), 1, 0, 0, 0, 0);
             p.getWorld().spawnParticle(Particle.DUST, c.clone().add(Math.cos(ang) * r * 0.6, 0.4, Math.sin(ang) * r * 0.6), 1, 0, 0, 0, 0, violet(1.5f));
@@ -427,135 +440,6 @@ public class CivGoObjets extends JavaPlugin implements Listener, TabExecutor {
 
     private String key(Block b) {
         return b.getWorld().getName() + "," + b.getX() + "," + b.getY() + "," + b.getZ();
-    }
-
-    // ------------------------------------------------------------ Casque Lunaire
-
-    private void helmetTick() {
-        boolean noir = noirActive();
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            if (!"casque_lunaire".equals(model(p.getInventory().getHelmet()))) continue;
-            p.removePotionEffect(PotionEffectType.DARKNESS);
-            if (noir) p.addPotionEffect(new PotionEffect(PotionEffectType.NIGHT_VISION, 20 * 15, 0, true, false, false));
-        }
-    }
-
-    // ------------------------------------------------------------ Lanterne Lunaire (objet posable)
-
-    private void placeLantern(Player p, PlayerInteractEvent e) {
-        BlockFace f = e.getBlockFace();
-        if (f != BlockFace.UP && f != BlockFace.DOWN) {
-            bar(p, "§7Pose la lanterne sur le sol ou contre un plafond.");
-            return;
-        }
-        Block target = e.getClickedBlock().getRelative(f);
-        if (!target.getType().isAir() || lanterns.containsKey(key(target))) return;
-        World w = target.getWorld();
-        Location loc = target.getLocation().add(0.5, 0.5, 0.5);
-        ItemDisplay d = w.spawn(loc, ItemDisplay.class, dd -> {
-            dd.setItemStack(lanternItem(false));
-            dd.setBrightness(new Display.Brightness(6, 6));
-            dd.addScoreboardTag(TAG);
-        });
-        Interaction in = w.spawn(target.getLocation().add(0.5, 0.05, 0.5), Interaction.class, ii -> {
-            ii.setInteractionWidth(0.5f);
-            ii.setInteractionHeight(0.95f);
-            ii.addScoreboardTag(TAG);
-        });
-        lanterns.put(key(target), new UUID[]{d.getUniqueId(), in.getUniqueId()});
-        saveLanterns();
-        if (p.getGameMode() != GameMode.CREATIVE) {
-            ItemStack hand = p.getInventory().getItemInMainHand();
-            hand.setAmount(hand.getAmount() - 1);
-        }
-        w.playSound(loc, Sound.BLOCK_LANTERN_PLACE, 1f, 1f);
-    }
-
-    @EventHandler
-    public void onLanternHit(EntityDamageByEntityEvent e) {
-        if (!(e.getEntity() instanceof Interaction in) || !in.getScoreboardTags().contains(TAG)) return;
-        e.setCancelled(true);
-        if (!(e.getDamager() instanceof Player p)) return;
-        for (Map.Entry<String, UUID[]> en : new ArrayList<>(lanterns.entrySet())) {
-            if (!en.getValue()[1].equals(in.getUniqueId())) continue;
-            removeLantern(en.getKey(), en.getValue(), p.getGameMode() != GameMode.CREATIVE);
-            return;
-        }
-        in.remove();
-    }
-
-    private void removeLantern(String k, UUID[] ids, boolean drop) {
-        String[] s = k.split(",");
-        World w = Bukkit.getWorld(s[0]);
-        if (w != null) {
-            Block b = w.getBlockAt(Integer.parseInt(s[1]), Integer.parseInt(s[2]), Integer.parseInt(s[3]));
-            if (b.getType() == Material.LIGHT) b.setType(Material.AIR, false);
-            if (drop) w.dropItemNaturally(b.getLocation().add(0.5, 0.5, 0.5), lanternItem(false));
-        }
-        for (UUID id : ids) {
-            Entity en = Bukkit.getEntity(id);
-            if (en != null) en.remove();
-        }
-        lanterns.remove(k);
-        saveLanterns();
-    }
-
-    /** Toutes les secondes : la lanterne ne luit que pendant les Noirs (lumière + particules violettes). */
-    private void lanternTick() {
-        if (lanterns.isEmpty()) return;
-        boolean noir = noirActive();
-        for (Map.Entry<String, UUID[]> en : new ArrayList<>(lanterns.entrySet())) {
-            String[] s = en.getKey().split(",");
-            World w = Bukkit.getWorld(s[0]);
-            if (w == null) continue;
-            int x = Integer.parseInt(s[1]), y = Integer.parseInt(s[2]), z = Integer.parseInt(s[3]);
-            if (!w.isChunkLoaded(x >> 4, z >> 4)) continue;
-            Entity d = Bukkit.getEntity(en.getValue()[0]);
-            if (!(d instanceof ItemDisplay disp)) {              // l'objet a disparu (kill, etc.)
-                removeLantern(en.getKey(), en.getValue(), false);
-                continue;
-            }
-            Block b = w.getBlockAt(x, y, z);
-            if (noir) {
-                if (b.getType().isAir() || b.getType() == Material.LIGHT) {
-                    Light l = (Light) Material.LIGHT.createBlockData();
-                    l.setLevel(15);
-                    b.setBlockData(l, false);
-                }
-                disp.setItemStack(lanternItem(true));
-                disp.setBrightness(new Display.Brightness(15, 15));
-                Location c = b.getLocation().add(0.5, 0.5, 0.5);
-                w.spawnParticle(Particle.DUST, c, 8, 0.35, 0.4, 0.35, 0, violet(1.2f));
-                w.spawnParticle(Particle.END_ROD, c, 1, 0.3, 0.4, 0.3, 0.01);
-            } else {
-                if (b.getType() == Material.LIGHT) b.setType(Material.AIR, false);
-                disp.setItemStack(lanternItem(false));
-                disp.setBrightness(new Display.Brightness(6, 6));
-            }
-        }
-    }
-
-    private void loadLanterns() {
-        YamlConfiguration y = YamlConfiguration.loadConfiguration(lanternFile);
-        for (String line : y.getStringList("lanternes")) {
-            String[] p = line.split(";");
-            if (p.length == 3) lanterns.put(p[0], new UUID[]{UUID.fromString(p[1]), UUID.fromString(p[2])});
-        }
-    }
-
-    private void saveLanterns() {
-        YamlConfiguration y = new YamlConfiguration();
-        List<String> out = new ArrayList<>();
-        for (Map.Entry<String, UUID[]> en : lanterns.entrySet()) {
-            out.add(en.getKey() + ";" + en.getValue()[0] + ";" + en.getValue()[1]);
-        }
-        y.set("lanternes", out);
-        try {
-            getDataFolder().mkdirs();
-            y.save(lanternFile);
-        } catch (IOException ex) {
-            getLogger().warning("Sauvegarde des lanternes impossible : " + ex.getMessage());
-        }
     }
 
     // ------------------------------------------------------------ commande
